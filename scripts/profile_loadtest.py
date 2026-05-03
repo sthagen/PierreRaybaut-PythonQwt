@@ -1,4 +1,4 @@
-"""Profile ``qwt.tests.test_loadtest`` under :mod:`cProfile`.
+r"""Profile ``qwt.tests.test_loadtest`` under :mod:`cProfile`.
 
 First-pass tool for performance investigation: identifies which functions
 dominate cumulative time and total time. Use :mod:`lineprofile_loadtest` for

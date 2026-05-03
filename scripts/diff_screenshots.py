@@ -29,7 +29,7 @@ Usage
 -----
 ::
 
-    python scripts/diff_screenshots.py shots\master\pyqt5 shots\fix\pyqt5
+    python scripts/diff_screenshots.py shots\\master\\pyqt5 shots\fix\\pyqt5
 
 Output is a Markdown table; pipe through ``Select-String DIFFER|Summary`` to
 focus on regressions only.

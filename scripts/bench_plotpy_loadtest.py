@@ -27,7 +27,7 @@ Usage
     # PowerShell, with the PyQt5 venv prepared as described in scripts/README.md
     $env:QT_API = "pyqt5"
     $env:PYTHONPATH = "c:\\Dev\\PlotPy;c:\\Dev\\guidata"
-    & .\.venvs\pyqt5\Scripts\python.exe scripts\bench_plotpy_loadtest.py --repeat 3 --nplots 60
+    & .\\.venvs\\pyqt5\\Scripts\\python.exe scripts\bench_plotpy_loadtest.py --repeat 3 --nplots 60
 
 Output contains a line compatible with ``scripts/bench_qt.ps1``'s parser::
 

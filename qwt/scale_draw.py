@@ -24,7 +24,6 @@ from datetime import datetime
 
 from qtpy.QtCore import (
     QLineF,
-    QObject,
     QPoint,
     QPointF,
     QRect,

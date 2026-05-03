@@ -25,7 +25,7 @@ Usage
 ::
 
     $env:QT_API = "pyqt5"
-    & .\.venvs\pyqt5\Scripts\python.exe scripts\capture_screenshots.py shots\fix\pyqt5
+    & .\\.venvs\\pyqt5\\Scripts\\python.exe scripts\\capture_screenshots.py shots\fix\\pyqt5
 
 The output directory is created if missing. After the run, leftover PNGs in
 ``qwt/tests/data/`` should be cleaned up (only newly-untracked PNGs are

@@ -1,4 +1,4 @@
-"""Line-profile a curated set of PythonQwt hot functions under the load test.
+r"""Line-profile a curated set of PythonQwt hot functions under the load test.
 
 Second-pass tool for performance investigation, used after
 :mod:`profile_loadtest` has identified the hot families. Line-by-line
