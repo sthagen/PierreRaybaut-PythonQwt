@@ -72,13 +72,34 @@ QWIDGETSIZE_MAX = (1 << 24) - 1
 QT_API = os.environ["QT_API"]
 
 
+# Cache Qt alignment flags as plain ints once at import time. On PyQt6 these
+# are ``Qt.AlignmentFlag`` enum members and every bitwise test goes through
+# ``enum.__and__`` (~6 us each). The test code below combines them in hot
+# paths called per-tick / per-label / per-paint event.
+def _flag_int(flag):
+    """Return the integer value of a Qt enum/flag (PyQt5 and PyQt6)."""
+    try:
+        return flag.value
+    except AttributeError:
+        return int(flag)
+
+
+_ALIGN_LEFT = _flag_int(Qt.AlignLeft)
+_ALIGN_RIGHT = _flag_int(Qt.AlignRight)
+_ALIGN_TOP = _flag_int(Qt.AlignTop)
+_ALIGN_BOTTOM = _flag_int(Qt.AlignBottom)
+_ALIGN_HCENTER = _flag_int(Qt.AlignHCenter)
+_ALIGN_JUSTIFY = _flag_int(Qt.AlignJustify)
+_ALIGN_CENTER = _flag_int(Qt.AlignCenter)
+
+
 def taggedRichText(text, flags):
     richText = text
-    if flags & Qt.AlignJustify:
+    if flags & _ALIGN_JUSTIFY:
         richText = '<div align="justify">' + richText + "</div>"
-    elif flags & Qt.AlignRight:
+    elif flags & _ALIGN_RIGHT:
         richText = '<div align="right">' + richText + "</div>"
-    elif flags & Qt.AlignHCenter:
+    elif flags & _ALIGN_HCENTER:
         richText = '<div align="center">' + richText + "</div>"
     return richText
 
@@ -189,46 +210,64 @@ class QwtTextEngine(object):
 
 ASCENTCACHE = {}
 
-# Module-level cache: ``id(font) -> (font_strong_ref, font.key())``.
-# Computing ``QFont.key()`` is one of the dominant per-tick costs (it shows
-# up around 25% of ``QwtText.textSize`` total time and 60% of
-# ``QwtPlainTextEngine.textMargins``). We can avoid the call entirely as long
-# as we cache by the QFont's Python id; we keep a strong reference next to
-# the cached key so the id cannot be reused for a different live QFont.
-# The cache is bounded; once it grows past the limit it is rebuilt to keep
-# only the most recently inserted entry. Tick-rendering uses a tiny number
-# of fonts in practice so a small cap is sufficient.
+# Module-level cache: ``id(font) -> tuple_key`` (fast path) and
+# ``tuple_key -> tuple_key`` (slow path). The tuple key is built from a
+# handful of QFont attributes that uniquely identify the *logical* font for
+# metrics purposes. Tick-rendering uses very few distinct fonts in practice
+# so both dicts stay tiny.
 #
-# NOTE: the id-keyed fast path is intentionally disabled on Qt 5. On Qt 5
-# the order in which QFont instances trigger metrics initialisation has a
-# subtle (sub-perceptual) effect on antialiased text rendering, which made
-# a handful of test screenshots differ by a few pixels at edges. Skipping
-# the fast path on Qt 5 keeps the rendering bit-identical to upstream.
-# Qt 6 (PyQt6/PySide6) is unaffected and continues to benefit from the
-# fast path - which is also where the optimisation matters most.
-from qtpy import QT_VERSION as _QT_VERSION  # noqa: E402
+# This replaces the previous ``id(font) -> font.key()`` design. Two reasons:
+#
+# 1. ``QFont.key()`` is a sip dispatch that costs ~3.3 us/call on PyQt5 and
+#    ~9.3 us/call on PyQt6 -- it became the single biggest residual hotspot
+#    in ``QwtText.textSize`` on PyQt6.
+# 2. PyQt6 returns a fresh Python wrapper around the same QFont on most
+#    calls, so ``id(font)`` changes between calls and the id-keyed fast path
+#    misses ~92% of the time. The tuple-key second level recovers the hits
+#    those misses would have produced, without paying for ``font.key()``.
+#
+# The tuple key uses ``(family, pixelSize-or-pointSizeF, weight, italic,
+# stretch, styleStrategy)``. This is what determines ``QFontMetrics`` output
+# in practice; if two QFonts share these values they share metrics.
 
-_FONT_KEY_CACHE: dict = {}
+_FONT_KEY_CACHE: dict = {}  # id(font) -> tuple_key (fast path)
+_FONT_TUPLE_CACHE: dict = {}  # tuple_key -> tuple_key (interning, also acts
+#                              as the "have we seen this logical font" set)
 _FONT_KEY_CACHE_LIMIT = 1024
-_USE_FONT_KEY_FAST_PATH = not str(_QT_VERSION).startswith("5.")
 
 
-def font_key_cached(font) -> str:
-    """Return ``font.key()`` using a process-wide id-keyed cache.
+def _font_tuple_key(font):
+    """Build a hashable tuple identifying the logical font."""
+    px = font.pixelSize()
+    return (
+        font.family(),
+        px if px > 0 else font.pointSizeF(),
+        font.weight(),
+        font.italic(),
+        font.stretch(),
+        font.styleStrategy(),
+    )
 
-    On Qt 5 this is a thin wrapper around ``font.key()`` (see module note).
+
+def font_key_cached(font):
+    """Return a hashable cache key uniquely identifying ``font`` for metrics.
+
+    The returned value is **not** ``QFont.key()`` -- it is a tuple computed
+    from a handful of QFont attributes. It is safe to use as a dict key for
+    metrics caches (callers in this module always compare by ``==`` only).
     """
-    if not _USE_FONT_KEY_FAST_PATH:
-        return font.key()
     fid = id(font)
     entry = _FONT_KEY_CACHE.get(fid)
     if entry is not None:
         return entry[1]
+    tkey = _font_tuple_key(font)
+    # Intern: reuse the same tuple object across all id() variants so dict
+    # lookups in caller-side caches benefit from object-identity hash hits.
+    interned = _FONT_TUPLE_CACHE.setdefault(tkey, tkey)
     if len(_FONT_KEY_CACHE) >= _FONT_KEY_CACHE_LIMIT:
         _FONT_KEY_CACHE.clear()
-    key = font.key()
-    _FONT_KEY_CACHE[fid] = (font, key)
-    return key
+    _FONT_KEY_CACHE[fid] = (font, interned)
+    return interned
 
 
 def get_screen_resolution():
@@ -274,14 +313,14 @@ class QwtPlainTextEngine(QwtTextEngine):
         self._margins_last_value = None
 
     def fontmetrics(self, font):
-        fid = font.toString()
+        fid = font_key_cached(font)
         try:
             return self._fm_cache[fid]
         except KeyError:
             return self._fm_cache.setdefault(fid, QFontMetrics(font))
 
     def fontmetrics_f(self, font):
-        fid = font.toString()
+        fid = font_key_cached(font)
         try:
             return self._fm_cache_f[fid]
         except KeyError:
@@ -800,7 +839,13 @@ class QwtText(object):
             :py:meth:`renderFlags()`,
             :py:meth:`qwt.text.QwtTextEngine.draw()`
         """
-        renderFlags = Qt.AlignmentFlag(renderFlags)
+        # Wrap into Qt.AlignmentFlag so that downstream Qt APIs (notably
+        # ``QTextOption.setAlignment``, ``QPainter.drawText``,
+        # ``QFontMetrics.boundingRect``) that strictly require an enum on
+        # PyQt6 keep working. Hot bitwise-test sites locally cast back to
+        # int to avoid the per-test enum.__and__ cost.
+        if not isinstance(renderFlags, Qt.AlignmentFlag):
+            renderFlags = Qt.AlignmentFlag(renderFlags)
         if renderFlags != self.__data.renderFlags:
             self.__data.renderFlags = renderFlags
             self.__layoutCache.invalidate()
@@ -1377,10 +1422,10 @@ class QwtTextLabel(QFrame):
         if indent <= 0:
             indent = self.defaultIndent()
         if indent > 0:
-            align = self.__data.text.renderFlags()
-            if align & Qt.AlignLeft or align & Qt.AlignRight:
+            align = _flag_int(self.__data.text.renderFlags())
+            if align & (_ALIGN_LEFT | _ALIGN_RIGHT):
                 mw += self.__data.indent
-            elif align & Qt.AlignTop or align & Qt.AlignBottom:
+            elif align & (_ALIGN_TOP | _ALIGN_BOTTOM):
                 mh += self.__data.indent
         sz += QSizeF(mw, mh)
         return QSize(math.ceil(sz.width()), math.ceil(sz.height()))
@@ -1390,15 +1435,15 @@ class QwtTextLabel(QFrame):
         :param int width: Width
         :return: Preferred height for this widget, given the width.
         """
-        renderFlags = self.__data.text.renderFlags()
+        renderFlags = _flag_int(self.__data.text.renderFlags())
         indent = self.__data.indent
         if indent <= 0:
             indent = self.defaultIndent()
         width -= 2 * self.frameWidth()
-        if renderFlags & Qt.AlignLeft or renderFlags & Qt.AlignRight:
+        if renderFlags & (_ALIGN_LEFT | _ALIGN_RIGHT):
             width -= indent
         height = math.ceil(self.__data.text.heightForWidth(width, self.font()))
-        if renderFlags & Qt.AlignTop or renderFlags & Qt.AlignBottom:
+        if renderFlags & (_ALIGN_TOP | _ALIGN_BOTTOM):
             height += indent
         height += 2 * self.frameWidth()
         return height
@@ -1458,14 +1503,14 @@ class QwtTextLabel(QFrame):
             if indent <= 0:
                 indent = self.defaultIndent()
             if indent > 0:
-                renderFlags = self.__data.text.renderFlags()
-                if renderFlags & Qt.AlignLeft:
+                renderFlags = _flag_int(self.__data.text.renderFlags())
+                if renderFlags & _ALIGN_LEFT:
                     r.setX(r.x() + indent)
-                elif renderFlags & Qt.AlignRight:
+                elif renderFlags & _ALIGN_RIGHT:
                     r.setWidth(r.width() - indent)
-                elif renderFlags & Qt.AlignTop:
+                elif renderFlags & _ALIGN_TOP:
                     r.setY(r.y() + indent)
-                elif renderFlags & Qt.AlignBottom:
+                elif renderFlags & _ALIGN_BOTTOM:
                     r.setHeight(r.height() - indent)
         return r
 

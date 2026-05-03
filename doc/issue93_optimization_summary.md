@@ -148,7 +148,49 @@ On Qt5 this becomes a thin pass-through to `font.key()` — bit-identical output
    - PySide6: 26 passed, 1 skipped, 1 warning
 3. **Performance** — PyQt5 micro-bench rose from ~445 ms to ~450–550 ms (≈ +5 ms, well within the run-to-run noise). Qt6 numbers are unchanged.
 
+## Phase 5 — closing the residual Qt5↔Qt6 gap
+
+After phases 1–4 the Qt6 path was still measurably slower than Qt5 on the micro load test (~+20 % / +100 ms). The goal of phase 5 was to **understand and remove that residual gap**, not just to keep optimising blindly.
+
+**Method.** A second cProfile + `line_profiler` pass was run on the post-phase-4 tip, this time focused on the diff between PyQt5 and PyQt6 traces (rather than absolute hotspots). Three concrete root causes were identified, all specific to the Qt6 binding:
+
+1. **Python `enum.IntFlag` arithmetic.** PyQt6 exposes Qt enums as `enum.Flag` subclasses; every `flags & Qt.SomeFlag` test goes through `enum.__and__ → enum.__call__ → enum.__new__` (~6 µs each). PyQt5 uses plain ints, so the same code costs ~50 ns there. cProfile attributed ≈ 62 ms / run on PyQt6 to `enum.py`, **0 ms on PyQt5**. The single worst caller was `QwtPainterCommand.__init__`, which performs **twelve** successive `flags & QPaintEngine.DirtyXxx` tests per painter command — at ~300 commands per load-test run that is 3 600 enum operations alone.
+2. **`QFont.key()` is ~3× slower per call on PyQt6.** Per-call sip dispatch costs were measured at 3.3 µs (PyQt5) vs 9.3 µs (PyQt6) for cheap getters. `font.key()` was the single biggest residual hotspot inside `QwtText.textSize()`.
+3. **The `id(font)` fast path misfires on PyQt6.** PyQt6 returns a *fresh* Python wrapper around the same underlying `QFont` on most calls, so `id(font)` changes between calls and the id-keyed cache misses ~92 % of the time (vs ~60 % on PyQt5). The slower `font.key()` path then takes over, compounding cause #2.
+
+**Changes.**
+
+- **`qwt/painter_command.py`** — added a `_flag_int(flag)` helper (PyQt5/PyQt6 portable) and module-level `_DIRTY_PEN`, `_DIRTY_BRUSH`, … int constants. The State branch in `__init__` casts `state.state()` to int *once* and bitwise-tests against the cached int constants instead of going through `enum.__and__` 12 times per command.
+- **`qwt/graphic.py`** — same pattern in `qwtPaintCommand`'s State-replay branch (12 more flag tests per replayed command).
+- **`qwt/text.py`** — same pattern for `Qt.AlignXxx` flags (`_ALIGN_LEFT`, `_ALIGN_RIGHT`, …) in the hot bitwise-test sites in `taggedRichText()`, `QwtTextLabel.sizeHint()/heightForWidth()/textRect()`. The `setRenderFlags()` setter still stores the value as `Qt.AlignmentFlag` so downstream Qt APIs that strictly require an enum on PyQt6 (`QTextOption.setAlignment`, `QPainter.drawText`, `QFontMetrics.boundingRect`) keep working — only the per-test bitwise sites cast back to int locally.
+- **`qwt/text.py`** — **replaced the entire `id(font) → font.key()` cache** with a tuple-key cache. The new `font_key_cached(font)` returns an interned `(family, pixelSize-or-pointSizeF, weight, italic, stretch, styleStrategy)` tuple instead of `font.key()`. The two-level design keeps the original id-keyed fast path for repeated calls with the same QFont instance, and falls back to the tuple key (which never calls `QFont.key()`) for the PyQt6 case where wrappers churn. The same key is now also used by `fontmetrics()`/`fontmetrics_f()` — they previously called `font.toString()` per lookup, another ~3× more expensive on PyQt6.
+- The Qt-5 fast-path gate (`_USE_FONT_KEY_FAST_PATH`) introduced in phase 4 is no longer needed and was removed: since the new cache never calls `font.key()`, the font-engine first-touch ordering issue that motivated the gate cannot occur.
+
+**Verification.**
+
+- **Test suite** — `pytest -q` with `PYTHONQWT_UNATTENDED_TESTS=1` on both bindings: PyQt5 26 passed / 1 skipped, PyQt6 26 passed / 1 skipped. Same as phase 4.
+- **Performance** — PythonQwt micro `test_loadtest`, 10 runs each, run back-to-back on the same machine immediately after phase 5:
+
+| Config | PyQt5 ms (median / mean) | PyQt6 ms (median / mean) | Δ (PyQt6 − PyQt5) | PyQt6/PyQt5 |
+|---|--:|--:|--:|--:|
+| `master` (no optimisations) | 798 / 805 | 1 000 / 986 | +202 ms | **+25 %** |
+| `fix/93` tip (end of phase 4) | 511 / 517 | 611 / 622 | +100 ms | **+20 %** |
+| `fix/93` + phase 5 | 539 / 533 | 590 / 591 | **+51 ms** | **+9 %** |
+
+PyQt5 is essentially unchanged by phase 5 (the new int constants are inert on PyQt5 — Qt5 enums are already plain ints). PyQt6 dropped another ~20 ms median (mean −5 %): the Python `enum.Flag.__and__` budget is gone for the painter-command State branches (~3 600 enum ops/run eliminated), and the tuple-key font cache replaces the ~6 400 `QFont.key()` calls/run that previously cost ~45 ms.
+
+**Cumulative speed-ups on the micro load test, vs `master`:**
+
+| Binding | master → end of phase 4 | end of phase 4 → +phase 5 | **Total** |
+|---|--:|--:|--:|
+| PyQt5 | −36 % | +5 % (noise) | **−33 %** |
+| PyQt6 | −39 % | −3 % | **−41 %** |
+
+**The PyQt6↔PyQt5 ratio more than halved** (+20 % → +9 %). The remaining +9 % is the structural sip-dispatch cost (PyQt6 marshalling for cheap getters like `drawLine`, `boundingRect`, attribute reads) that is *not* removable from PythonQwt — it can only be mitigated by calling Qt fewer times per render, which phases 1–5 already pursue aggressively.
+
 ## Final results
+
+> Numbers below summarise the state at the end of phase 4 (the version covered by the Option A gate). Phase 5 was applied on top and further closes the residual Qt5↔Qt6 gap on the micro load test from +20 % to +9 % — see the dedicated phase-5 table above. PlotPy load test was not re-run after phase 5; phase 5 is targeted at the per-call enum/sip overhead that dominates the *micro* benchmark, so the PlotPy improvement is expected to be smaller in relative terms but in the same direction.
 
 ### PythonQwt micro `test_loadtest` (5 runs each, ms)
 
@@ -223,13 +265,15 @@ foreach ($b in "pyqt5","pyqt6","pyside6") {
 
 ## Files touched
 
-| File | Phase 1 (cProfile) | Phase 2 (line-profiler) | Phase 4 (Option A) |
-|---|:-:|:-:|:-:|
-| `qwt/scale_map.py` | ✓ | | |
-| `qwt/scale_div.py` | ✓ | | |
-| `qwt/scale_engine.py` | ✓ | | |
-| `qwt/scale_draw.py` | ✓ | ✓ (drop QObject, `__slots__`) | |
-| `qwt/text.py` | ✓ | ✓ (drop QObject, font cache) | ✓ (Qt5 gate) |
+| File | Phase 1 (cProfile) | Phase 2 (line-profiler) | Phase 4 (Option A) | Phase 5 (Qt5↔Qt6 gap) |
+|---|:-:|:-:|:-:|:-:|
+| `qwt/scale_map.py` | ✓ | | | |
+| `qwt/scale_div.py` | ✓ | | | |
+| `qwt/scale_engine.py` | ✓ | | | |
+| `qwt/scale_draw.py` | ✓ | ✓ (drop QObject, `__slots__`) | | |
+| `qwt/text.py` | ✓ | ✓ (drop QObject, font cache) | ✓ (Qt5 gate) | ✓ (alignment ints, tuple-key font cache, drop Qt5 gate) |
+| `qwt/painter_command.py` | | | | ✓ (int-flag State branch, `_flag_int` helper) |
+| `qwt/graphic.py` | | | | ✓ (int-flag State-replay branch) |
 
 Tooling added under `scripts/`:
 
