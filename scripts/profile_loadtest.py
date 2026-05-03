@@ -1,7 +1,35 @@
-"""Profile the load test for issue #93 work.
+"""Profile ``qwt.tests.test_loadtest`` under :mod:`cProfile`.
 
-Runs ``qwt.tests.test_loadtest`` under cProfile, dumps the cumulative-time
-top-N functions plus a focused subset (qwt internals only).
+First-pass tool for performance investigation: identifies which functions
+dominate cumulative time and total time. Use :mod:`lineprofile_loadtest` for
+the second pass once a hot family of functions has been spotted. See
+``scripts/README.md`` and ``doc/issue93_optimization_summary.md``.
+
+What it does
+------------
+Runs the PythonQwt micro load test once under ``cProfile``, then prints three
+reports to stdout (and dumps the raw stats to ``<out_path>``):
+
+1. Top 40 by cumulative time (``--cumulative``).
+2. Top 40 by total time (``--tottime``).
+3. Top 40 by total time, restricted to ``qwt/`` internals.
+
+Prerequisites
+-------------
+* A Qt binding selected via ``QT_API`` (``pyqt5`` / ``pyqt6`` / ``pyside6``);
+  numbers are most informative when collected for each binding in turn.
+* PythonQwt importable.
+
+Usage
+-----
+::
+
+    $env:QT_API = "pyside6"
+    & .\.venvs\pyside6\Scripts\python.exe scripts\profile_loadtest.py pyside6.prof
+
+Open the dumped ``.prof`` file with ``snakeviz`` (``pip install snakeviz``)
+or ``gprof2dot`` for a graphical view. Diff the per-binding reports to spot
+overhead that scales with binding cost.
 """
 
 from __future__ import annotations

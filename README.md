@@ -123,6 +123,10 @@ From the source package:
 python -m build
 ```
 
+## Performance investigation
+
+Tooling for performance benchmarks, profiling and visual-regression checks across PyQt5/PyQt6/PySide6 lives in [`scripts/`](scripts/README.md). See [`doc/issue93_optimization_summary.md`](doc/issue93_optimization_summary.md) for a worked example.
+
 ## Copyrights
 
 ### Main code base
