@@ -198,12 +198,28 @@ ASCENTCACHE = {}
 # The cache is bounded; once it grows past the limit it is rebuilt to keep
 # only the most recently inserted entry. Tick-rendering uses a tiny number
 # of fonts in practice so a small cap is sufficient.
+#
+# NOTE: the id-keyed fast path is intentionally disabled on Qt 5. On Qt 5
+# the order in which QFont instances trigger metrics initialisation has a
+# subtle (sub-perceptual) effect on antialiased text rendering, which made
+# a handful of test screenshots differ by a few pixels at edges. Skipping
+# the fast path on Qt 5 keeps the rendering bit-identical to upstream.
+# Qt 6 (PyQt6/PySide6) is unaffected and continues to benefit from the
+# fast path - which is also where the optimisation matters most.
+from qtpy import QT_VERSION as _QT_VERSION  # noqa: E402
+
 _FONT_KEY_CACHE: dict = {}
 _FONT_KEY_CACHE_LIMIT = 1024
+_USE_FONT_KEY_FAST_PATH = not str(_QT_VERSION).startswith("5.")
 
 
 def font_key_cached(font) -> str:
-    """Return ``font.key()`` using a process-wide id-keyed cache."""
+    """Return ``font.key()`` using a process-wide id-keyed cache.
+
+    On Qt 5 this is a thin wrapper around ``font.key()`` (see module note).
+    """
+    if not _USE_FONT_KEY_FAST_PATH:
+        return font.key()
     fid = id(font)
     entry = _FONT_KEY_CACHE.get(fid)
     if entry is not None:
