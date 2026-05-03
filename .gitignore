@@ -69,3 +69,7 @@ docs/_build/
 
 # PyBuilder
 target/
+
+# Local benchmark venvs (issue #93)
+.venvs/
+

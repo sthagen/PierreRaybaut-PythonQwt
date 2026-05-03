@@ -226,6 +226,11 @@ class QwtPlainTextEngine(QwtTextEngine):
         self.qrectf_max = QRectF(0, 0, QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
         self._fm_cache = {}
         self._fm_cache_f = {}
+        self._margins_cache = {}
+        # Fast path: when textMargins is called repeatedly with the same
+        # QFont instance, skip the (expensive) font.key() Qt call.
+        self._margins_last_id = -1
+        self._margins_last_value = None
 
     def fontmetrics(self, font):
         fid = font.toString()
@@ -317,11 +322,19 @@ class QwtPlainTextEngine(QwtTextEngine):
         :param QFont font: Font of the text
         :return: tuple (left, right, top, bottom) representing margins
         """
-        left = right = 0
-        fm = self.fontmetrics(font)
-        top = fm.ascent() - self.effectiveAscent(font)
-        bottom = fm.descent()
-        return left, right, top, bottom
+        # Fast path: same QFont object as the previous call.
+        font_id = id(font)
+        if font_id == self._margins_last_id:
+            return self._margins_last_value
+        fkey = font.key()
+        cached = self._margins_cache.get(fkey)
+        if cached is None:
+            fm = self.fontmetrics(font)
+            cached = (0, 0, fm.ascent() - self.effectiveAscent(font), fm.descent())
+            self._margins_cache[fkey] = cached
+        self._margins_last_id = font_id
+        self._margins_last_value = cached
+        return cached
 
     def draw(self, painter, rect, flags, text):
         """
@@ -484,10 +497,13 @@ class QwtText_PrivateData(QObject):
 class QwtText_LayoutCache(object):
     def __init__(self):
         self.textSize = None
-        self.font = None
+        self.fontKey = None
+        self.fontId = -1
 
     def invalidate(self):
         self.textSize = None
+        self.fontKey = None
+        self.fontId = -1
 
 
 class QwtText(object):
@@ -994,17 +1010,24 @@ class QwtText(object):
         :param QFont defaultFont Font, used for the calculation if the text has no font
         :return: Caluclated size
         """
-        font = QFont(self.usedFont(defaultFont))
-        if (
-            self.__layoutCache.textSize is None
-            or not self.__layoutCache.textSize.isValid()
-            or self.__layoutCache.font is not font
-        ):
-            self.__layoutCache.textSize = self.__data.textEngine.textSize(
-                font, self.__data.renderFlags, self.__data.text
-            )
-            self.__layoutCache.font = font
-        sz = self.__layoutCache.textSize
+        font = self.usedFont(defaultFont)
+        cache = self.__layoutCache
+        font_id = id(font)
+        if cache.textSize is not None and cache.fontId == font_id:
+            sz = QSizeF(cache.textSize)
+        else:
+            fkey = font.key()
+            if (
+                cache.textSize is None
+                or not cache.textSize.isValid()
+                or cache.fontKey != fkey
+            ):
+                cache.textSize = self.__data.textEngine.textSize(
+                    font, self.__data.renderFlags, self.__data.text
+                )
+                cache.fontKey = fkey
+            cache.fontId = font_id
+            sz = QSizeF(cache.textSize)
         if self.__data.layoutAttributes & self.MinimumLayout:
             (left, right, top, bottom) = self.__data.textEngine.textMargins(font)
             sz -= QSizeF(left + right, top + bottom)
@@ -1072,7 +1095,13 @@ class QwtText(object):
             return self.__map.get(format_)
         elif format_ is not None:
             if format_ == QwtText.AutoText:
-                for key, engine in list(self.__map.items()):
+                # Fast path: a string with no ``<`` cannot be rich text, so
+                # we can return the plain engine without iterating the map
+                # and calling Qt.mightBeRichText (which is a hot Qt call
+                # for tick labels like " 1.5").
+                if "<" not in text:
+                    return self.__map[QwtText.PlainText]
+                for key, engine in self.__map.items():
                     if key != QwtText.PlainText:
                         if engine and engine.mightRender(text):
                             return engine

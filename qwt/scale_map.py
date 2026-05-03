@@ -249,13 +249,18 @@ class QwtScaleMap(object):
 
             :py:meth:`invTransform()`
         """
-        if len(args) == 1:
-            # Scalar transform
-            return self.transform_scalar(args[0])
-        elif len(args) == 3 and isinstance(args[2], QPointF):
+        nargs = len(args)
+        if nargs == 1:
+            # Scalar transform: inline the fast path for the dominant case
+            # (avoids one Python call frame per tick label).
+            s = args[0]
+            if self.__transform:
+                s = self.__transform.transform(s)
+            return self.__p1 + (s - self.__ts1) * self.__cnv
+        elif nargs == 3 and isinstance(args[2], QPointF):
             xMap, yMap, pos = args
             return QPointF(xMap.transform(pos.x()), yMap.transform(pos.y()))
-        elif len(args) == 3 and isinstance(args[2], QRectF):
+        elif nargs == 3 and isinstance(args[2], QRectF):
             xMap, yMap, rect = args
             x1 = xMap.transform(rect.left())
             x2 = xMap.transform(rect.right())
