@@ -51,10 +51,22 @@ _ALIGN_TOP = int(Qt.AlignTop)
 _ALIGN_BOTTOM = int(Qt.AlignBottom)
 
 
-class QwtAbstractScaleDraw_PrivateData(QObject):
-    def __init__(self):
-        QObject.__init__(self)
+class QwtAbstractScaleDraw_PrivateData(object):
+    # See QwtText_PrivateData: ``QObject`` inheritance is unused and the
+    # base class' ``__init__`` is a measurable cost in tick-heavy renders.
+    __slots__ = (
+        "spacing",
+        "penWidth",
+        "minExtent",
+        "components",
+        "tick_length",
+        "tick_lighter_factor",
+        "map",
+        "scaleDiv",
+        "labelCache",
+    )
 
+    def __init__(self):
         self.spacing = 4
         self.penWidth = 0
         self.minExtent = 0.0
@@ -481,12 +493,25 @@ class QwtAbstractScaleDraw(object):
         self.__data.labelCache.clear()
 
 
-class QwtScaleDraw_PrivateData(QObject):
-    def __init__(self):
-        QObject.__init__(self)
+class QwtScaleDraw_PrivateData(object):
+    # See QwtText_PrivateData: ``QObject`` inheritance is unused and the
+    # base class' ``__init__`` is a measurable cost in tick-heavy renders.
+    __slots__ = (
+        "len",
+        "alignment",
+        "orientation",
+        "labelAlignment",
+        "labelRotation",
+        "labelAutoSize",
+        "pos",
+    )
 
+    def __init__(self):
         self.len = 0
         self.alignment = QwtScaleDraw.BottomScale
+        # Cached orientation - kept in sync by ``QwtScaleDraw.setAlignment``
+        # so that the very hot ``orientation()`` accessor avoids any test.
+        self.orientation = Qt.Horizontal
         self.labelAlignment = 0
         self.labelRotation = 0.0
         self.labelAutoSize = True
@@ -565,6 +590,11 @@ class QwtScaleDraw(QwtAbstractScaleDraw):
             :py:meth:`alignment()`
         """
         self.__data.alignment = align
+        # Keep cached orientation in sync (see ``orientation()``).
+        if align == self.BottomScale or align == self.TopScale:
+            self.__data.orientation = Qt.Horizontal
+        else:
+            self.__data.orientation = Qt.Vertical
 
     def orientation(self):
         """
@@ -579,13 +609,8 @@ class QwtScaleDraw(QwtAbstractScaleDraw):
 
             :py:meth:`alignment()`
         """
-        # Direct comparisons (no tuple ``in`` membership check) — this is
-        # called per-tick in label layout and shows up in profiles.
-        align = self.__data.alignment
-        if align == self.BottomScale or align == self.TopScale:
-            return Qt.Horizontal
-        if align == self.LeftScale or align == self.RightScale:
-            return Qt.Vertical
+        # Pre-computed by ``setAlignment`` - this method is called per tick.
+        return self.__data.orientation
 
     def getBorderDistHint(self, font):
         """

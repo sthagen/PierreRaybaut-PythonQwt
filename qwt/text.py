@@ -189,6 +189,31 @@ class QwtTextEngine(object):
 
 ASCENTCACHE = {}
 
+# Module-level cache: ``id(font) -> (font_strong_ref, font.key())``.
+# Computing ``QFont.key()`` is one of the dominant per-tick costs (it shows
+# up around 25% of ``QwtText.textSize`` total time and 60% of
+# ``QwtPlainTextEngine.textMargins``). We can avoid the call entirely as long
+# as we cache by the QFont's Python id; we keep a strong reference next to
+# the cached key so the id cannot be reused for a different live QFont.
+# The cache is bounded; once it grows past the limit it is rebuilt to keep
+# only the most recently inserted entry. Tick-rendering uses a tiny number
+# of fonts in practice so a small cap is sufficient.
+_FONT_KEY_CACHE: dict = {}
+_FONT_KEY_CACHE_LIMIT = 1024
+
+
+def font_key_cached(font) -> str:
+    """Return ``font.key()`` using a process-wide id-keyed cache."""
+    fid = id(font)
+    entry = _FONT_KEY_CACHE.get(fid)
+    if entry is not None:
+        return entry[1]
+    if len(_FONT_KEY_CACHE) >= _FONT_KEY_CACHE_LIMIT:
+        _FONT_KEY_CACHE.clear()
+    key = font.key()
+    _FONT_KEY_CACHE[fid] = (font, key)
+    return key
+
 
 def get_screen_resolution():
     """Return screen resolution: tuple of floats (DPIx, DPIy)"""
@@ -275,7 +300,7 @@ class QwtPlainTextEngine(QwtTextEngine):
 
     def effectiveAscent(self, font):
         global ASCENTCACHE
-        fontKey = font.key()
+        fontKey = font_key_cached(font)
         ascent = ASCENTCACHE.get(fontKey)
         if ascent is not None:
             return ascent
@@ -326,7 +351,7 @@ class QwtPlainTextEngine(QwtTextEngine):
         font_id = id(font)
         if font_id == self._margins_last_id:
             return self._margins_last_value
-        fkey = font.key()
+        fkey = font_key_cached(font)
         cached = self._margins_cache.get(fkey)
         if cached is None:
             fm = self.fontmetrics(font)
@@ -477,10 +502,26 @@ class QwtRichTextEngine(QwtTextEngine):
         return 0, 0, 0, 0
 
 
-class QwtText_PrivateData(QObject):
-    def __init__(self):
-        QObject.__init__(self)
+class QwtText_PrivateData(object):
+    # ``QObject`` was previously used as the base class but no Qt signals
+    # or events are ever emitted from ``_PrivateData`` containers and the
+    # ``QObject.__init__`` call dominates ``QwtText.__init__`` (it is the
+    # single most expensive line for tick-label-heavy renders, see
+    # https://github.com/PlotPyStack/PythonQwt/issues/93).
+    __slots__ = (
+        "renderFlags",
+        "borderRadius",
+        "borderPen",
+        "backgroundBrush",
+        "paintAttributes",
+        "layoutAttributes",
+        "textEngine",
+        "text",
+        "font",
+        "color",
+    )
 
+    def __init__(self):
         self.renderFlags = Qt.AlignCenter
         self.borderRadius = 0
         self.borderPen = Qt.NoPen
@@ -1016,7 +1057,7 @@ class QwtText(object):
         if cache.textSize is not None and cache.fontId == font_id:
             sz = QSizeF(cache.textSize)
         else:
-            fkey = font.key()
+            fkey = font_key_cached(font)
             if (
                 cache.textSize is None
                 or not cache.textSize.isValid()
